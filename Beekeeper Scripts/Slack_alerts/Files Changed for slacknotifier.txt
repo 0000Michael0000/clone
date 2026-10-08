@@ -1,0 +1,9 @@
+Files Changed for slack-notifier:
+
+docker-compose.yml              added rabbitmq and slack-notifier services, enabling the
+                                notifier to boot with docker startup instead of being a
+                                script that has to be run locally
+
+configurations/beelzebub.yaml   enabled rabbit-mq tracing (enabled: true) so
+                                Beelzebub publishes events to the queue
+

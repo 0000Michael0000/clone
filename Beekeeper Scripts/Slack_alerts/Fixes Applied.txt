@@ -1,0 +1,721 @@
+Fixes applied to slack-notifier
+===============================
+
+Files touched:
+  Beekeeper Scripts/Slack_alerts/slack_notifier.py   (rewritten, see below)
+  Beekeeper Scripts/Slack_alerts/Dockerfile          (added PYTHONUNBUFFERED)
+  Beekeeper Scripts/Slack_alerts/requirements.txt    (new)
+  docker-compose.yml                                 (healthcheck, port binding, env vars, extra_hosts)
+  .env                                               (new, gitignored - webhook + model name)
+  .env.example                                       (new, committable placeholder)
+  configurations/services/ssh-2222.yaml              (ollama host + model name)
+  Beekeeper Scripts/Ollama/pull-models.sh            (new, reads models from the configs)
+  .gitattributes                                     (new, forces LF on *.sh)
+
+
+----------------------------------------------------------------------
+1. WRONG JSON SHAPE - alerts were empty
+----------------------------------------------------------------------
+File: slack_notifier.py (on_message)
+
+Was:    event = json.loads(body)
+        details = event.get("event", {})
+
+Now:    details = json.loads(body)
+
+Why:    Beelzebub puts the event on the queue with json.Marshal(event) in
+        internal/builder/director.go:86, so the message body is already the
+        flat event:
+
+            {"DateTime":"...","Protocol":"SSH","SourceIp":"1.2.3.4",...}
+
+        There is no "event" key to unpack. The {"event": {...}} nesting only
+        appears in Beelzebub's own log output (director.go:82), not on the
+        queue. So .get("event", {}) returned an empty dict every time: every
+        field came out blank, every attacker was bucketed under the single IP
+        "unknown", and the 5 minute cooldown then suppressed everyone after
+        the first alert.
+
+        A json.JSONDecodeError guard was also added so one malformed message
+        cannot kill the consumer.
+
+
+----------------------------------------------------------------------
+2. SSH AND TCP EVENTS SHOWED A BLANK REQUEST
+----------------------------------------------------------------------
+File: slack_notifier.py (format_message)
+
+Was:    details.get("RequestURI", details.get("Command", ""))
+
+Now:    details.get("RequestURI") or details.get("Command") or ""
+
+Why:    This bug was hidden behind fix 1 (everything was blank anyway) and
+        only appears once the JSON shape is correct. Go marshals every field
+        of the event struct, including unused ones, so an SSH event still
+        carries "RequestURI":"" - the key is present, just empty. That means
+        dict.get("RequestURI", fallback) never reaches its fallback, and the
+        Command was never read. Testing the value instead of the key fixes it.
+
+        Same change for HTTPMethod, which is "" on non-HTTP events and was
+        leaving a stray leading space in the request line.
+
+Verified against both event shapes:
+        HTTP ->  **Request:** GET /.env
+        SSH  ->  **Request:** cat /etc/shadow
+
+
+----------------------------------------------------------------------
+3. DISCORD VS SLACK PAYLOAD FORMAT
+----------------------------------------------------------------------
+File: slack_notifier.py (top of file, format_message)
+
+Added:  PLATFORM = os.environ.get("PLATFORM", "discord").strip().lower()
+        PAYLOAD_KEY = "content" if PLATFORM == "discord" else "text"
+        BOLD = "**" if PLATFORM == "discord" else "*"
+
+Why:    Two things differ between the two services, not just one:
+
+        a) The payload key. Discord needs {"content": "..."} and rejects
+           {"text": "..."} with HTTP 400. Slack is the other way around.
+
+        b) The bold syntax. Discord is standard markdown and needs **bold**.
+           Slack uses its own "mrkdwn" where a single *bold* is bold. The
+           message was written with single asterisks, so on Discord every
+           field label would have rendered as italics instead of bold.
+
+        Both now follow from the one PLATFORM value. See "TO SWITCH TO SLACK"
+        at the bottom.
+
+
+----------------------------------------------------------------------
+4. FAILED WEBHOOK POSTS WERE SILENT
+----------------------------------------------------------------------
+File: slack_notifier.py (on_message)
+
+Was:    requests.post(...)
+        print(f"Alert sent for {ip}")
+
+Now:    the response is checked, and a non-2xx prints the status code plus the
+        body the webhook returned. Network errors are caught separately.
+
+Why:    The return value was discarded, so a rejected payload still printed
+        "Alert sent". This is what would have kept problem 3 invisible - the
+        400s would have looked like successful deliveries in the logs.
+
+Also:   added timeout=10 to the post. requests defaults to no timeout at all,
+        so a hung webhook would have blocked the consumer thread
+        indefinitely, stalling AMQP heartbeats and eventually dropping the
+        connection to the broker.
+
+
+----------------------------------------------------------------------
+5. BOOT ORDER RACE - BOTH CONTAINERS CRASHED ON FIRST START
+----------------------------------------------------------------------
+Files: docker-compose.yml, slack_notifier.py
+
+Was:    depends_on:
+              - rabbitmq
+
+Now:    depends_on:
+              rabbitmq:
+                condition: service_healthy
+
+        plus a healthcheck on the rabbitmq service:
+              test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+              interval: 10s / timeout: 5s / retries: 10 / start_period: 20s
+
+        plus restart: unless-stopped on rabbitmq, which had no restart policy
+        at all.
+
+Why:    Plain depends_on only waits for the container to START, not for
+        RabbitMQ to accept connections, and RabbitMQ takes 10-30s to come up.
+        So on a cold boot:
+          - Beelzebub: director.go:35 returns the dial error and main.go:18
+            exits 1. restart: always eventually recovered it, but only after
+            visible crash loops.
+          - slack-notifier: pika.BlockingConnection raised at import time and
+            the container died.
+
+        service_healthy makes both wait for a real broker ping instead.
+
+Also, in slack_notifier.py the connect/consume logic moved into a
+consume_forever() loop that retries every 5s on pika.exceptions.AMQPError,
+so the notifier survives a RabbitMQ restart later in the run, not just the
+cold boot. The script is now under an if __name__ == "__main__" guard
+instead of connecting at import time.
+
+
+----------------------------------------------------------------------
+6. RABBITMQ PORTS WERE EXPOSED TO THE INTERNET
+----------------------------------------------------------------------
+File: docker-compose.yml
+
+Was:    ports:
+              - "5672:5672"
+              - "15672:15672"
+
+Now:    ports:
+              - "127.0.0.1:5672:5672"
+              - "127.0.0.1:15672:15672"
+
+Why:    A bare "5672:5672" binds to 0.0.0.0, i.e. every interface on the VM
+        including the public one. The official rabbitmq image ships
+        loopback_users.guest = false (that is why guest:guest works from the
+        beelzebub container at all), so anyone who portscanned the honeypot
+        VM would have had the management UI on 15672 and the AMQP broker on
+        5672 with known default credentials. On a deliberately attacked host
+        that is a real way in, and it also lets someone read or inject
+        records in your event queue, which would quietly contaminate the data
+        the research depends on.
+
+        Adding the 127.0.0.1 prefix keeps the ports reachable from the VM
+        itself but not from outside. Nothing in the stack needs them
+        published at all - beelzebub and slack-notifier reach rabbitmq over
+        the compose network by container name - so deleting the whole ports
+        block also works and is marginally safer. They were kept on loopback
+        only so the management UI stays usable for debugging.
+
+        To open the management UI from your own machine, tunnel in over SSH
+        rather than publishing the port:
+
+            ssh -L 15672:127.0.0.1:15672 <user>@<vm-address>
+
+        then browse to http://localhost:15672 (guest / guest).
+
+        Worth doing separately: set RABBITMQ_DEFAULT_USER and
+        RABBITMQ_DEFAULT_PASS on the rabbitmq service and update the uri in
+        configurations/beelzebub.yaml to match, so guest:guest is not the
+        credential even on the internal network.
+
+
+----------------------------------------------------------------------
+7. WEBHOOK NO LONGER HARDCODED
+----------------------------------------------------------------------
+Files: slack_notifier.py, docker-compose.yml, .env, .env.example
+
+Was:    SLACK_WEBHOOK = "https://discord.com/api/webhooks/..."   (in the script)
+
+Now:    WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
+        if not WEBHOOK_URL:
+            raise SystemExit("WEBHOOK_URL is not set - add it to .env ...")
+
+        and in docker-compose.yml under slack-notifier:
+            environment:
+              WEBHOOK_URL: ${WEBHOOK_URL:-}
+              PLATFORM: ${PLATFORM:-discord}
+
+        The real value now lives in .env at the repo root, which is already
+        covered by .gitignore (line 9). .env.example is a committable
+        placeholder showing the two keys and both URL formats.
+
+Why:    Hardcoded, the webhook would have been committed to the repo on the
+        first `git add` of this folder, and baked into a layer of the
+        slack-notifier image - so it would leak to anyone who got a copy of
+        the image even if the line were deleted from the script later.
+
+Good news: "Beekeeper Scripts/" is still untracked (git ls-files returns
+nothing for it), so that webhook has NOT entered git history. Moving it to
+.env before the first commit keeps it out permanently, and no history
+rewrite is needed. Rotating it is still the safer call if the repo or the
+built image has been shared with anyone, since it has sat in a plaintext
+file on disk.
+
+Note: the script now exits immediately with a clear message if WEBHOOK_URL
+is empty, rather than starting up and silently failing to deliver anything.
+
+Renamed SLACK_WEBHOOK -> WEBHOOK_URL at the same time: the constant was
+called SLACK_WEBHOOK but held a Discord URL, which is what led to the
+Slack-shaped payload being sent to Discord in the first place.
+
+
+----------------------------------------------------------------------
+8. MISSING requirements.txt
+----------------------------------------------------------------------
+File: requirements.txt (new)
+
+        pika==1.3.2
+        requests==2.32.3
+
+Why:    The Dockerfile runs COPY requirements.txt . on line 3, so the image
+        build failed before it installed anything.
+
+
+----------------------------------------------------------------------
+9. NOTIFIER LOGS WERE INVISIBLE
+----------------------------------------------------------------------
+File: Dockerfile
+
+Added:  ENV PYTHONUNBUFFERED=1
+
+Why:    Python buffers stdout when it is not a terminal, so every print() in
+        the script - including "Listening for events" and each alert line -
+        would have sat in the buffer instead of reaching
+        `docker logs slack-notifier`. Easy to mistake for the notifier not
+        running at all, which matters given the point of this is boot-time
+        logging.
+
+
+----------------------------------------------------------------------
+10. OLLAMA HOST UNREACHABLE FROM THE CONTAINER
+----------------------------------------------------------------------
+File: docker-compose.yml (beelzebub service)
+
+Added:  extra_hosts:
+              - "host.docker.internal:host-gateway"
+
+Why:    configurations/services/ssh-2222.yaml points the LLMHoneypot plugin
+        at http://host.docker.internal:11434/api/chat. That hostname is
+        provided automatically by Docker Desktop on Windows and Mac, but NOT
+        by Docker Engine on Linux, which is what the Azure VM will run.
+        Without this mapping every SSH session on port 2222 fails to reach
+        Ollama.
+
+        Still to confirm on the VM: that Ollama is actually running there and
+        listening on 0.0.0.0:11434 rather than 127.0.0.1 (set
+        OLLAMA_HOST=0.0.0.0), and that `ollama list` really contains the tag
+        glm-4.7-flash named in ssh-2222.yaml.
+
+
+----------------------------------------------------------------------
+11. BLANK SECOND ALERT ON EVERY SSH SESSION
+----------------------------------------------------------------------
+File: slack_notifier.py (on_message)
+
+Was:    ip = details.get("SourceIp", "unknown")
+        path = details.get("RequestURI", "")
+
+Now:    ip = details.get("SourceIp") or ""
+        path = details.get("RequestURI") or ""
+        if not ip:
+            print(f"Skipping event with no source IP ({details.get('Msg','')})")
+            return
+
+Why:    Same key-exists-but-empty trap as fix 2, found while tracing what a
+        single SSH session actually emits. internal/protocols/strategies/SSH/ssh.go:175
+        traces an "End SSH Session" event with only Msg, Status, ID and
+        Protocol set - no SourceIp, no Command, no Description. Because Go
+        still marshals the field as "SourceIp":"", the .get() default of
+        "unknown" never fired and ip became the empty string.
+
+        That empty string is a different dict key from the real IP, so it
+        bypassed the per-IP cooldown and fired a second alert for every
+        single SSH session - one useful message, then one with a blank source
+        IP, blank request and blank response. An End event carries no
+        attacker information and is not probing activity, so it is now
+        dropped before the filter rather than alerted on.
+
+Verified by replaying all four events of one SSH session through on_message:
+        Alert sent for 91.92.250.3
+        Suppressed event from 91.92.250.3 ()
+        Suppressed event from 91.92.250.3 ()
+        Skipping event with no source IP (End SSH Session)
+  -> 1 message instead of 2.
+
+----------------------------------------------------------------------
+12. OLLAMA NOW RUNS AS A CONTAINER IN THE STACK
+----------------------------------------------------------------------
+Files: docker-compose.yml, configurations/services/ssh-2222.yaml, .env, .env.example
+
+Replaces fix 10. Ollama no longer has to be installed and kept running on the
+VM by hand - it comes up with `docker compose up -d` like everything else, and
+comes back by itself after a VM reboot.
+
+Added two services:
+
+  ollama          the model server. Named volume "ollama-models" mounted at
+                  /root/.ollama so the multi-GB model downloads once and
+                  survives restarts and rebuilds. Healthcheck is
+                  `ollama list`, which fails until the server answers.
+                  No ports published on purpose - only beelzebub talks to it,
+                  over the compose network. Publishing 11434 would put an
+                  unauthenticated model API on the public interface of a
+                  machine that is deliberately being attacked.
+
+  ollama-pull     one-shot container. Waits for ollama to be healthy, runs
+                  `ollama pull <model>`, exits. Beelzebub now also depends on
+                  it with condition: service_completed_successfully, so the
+                  honeypot never goes live without a model behind it. It
+                  re-runs on every `up` but is near-instant once the model is
+                  cached in the volume.
+
+Config change in ssh-2222.yaml:
+
+  Was:  host: "http://host.docker.internal:11434/api/chat"
+  Now:  host: "http://ollama:11434/api/chat"
+
+        Containers on a compose file reach each other by service name, the
+        same way slack_notifier.py connects to the host "rabbitmq". The
+        host.docker.internal reach-around is gone, so the Linux-only problem
+        in fix 10 no longer applies. The extra_hosts line was left in place
+        (harmless) in case anything is ever pointed back at the VM host.
+
+MODEL CHANGED - please confirm this one:
+
+  Was:  llmModel: "glm-4.7-flash"
+  Now:  llmModel: "llama3.2:3b"
+
+        glm-4.7-flash could not be verified as a name `ollama pull` accepts -
+        it reads like Zhipu's hosted API naming rather than a tag in Ollama's
+        library. Because beelzebub now waits for the pull to succeed, an
+        invalid tag means the whole stack refuses to start, so it was swapped
+        for a small CPU-friendly model that definitely exists. llama3.2:3b is
+        about 2GB and is a placeholder, not a recommendation - check
+        ollama.com/library and change it if you want something else.
+
+ONE PLACE TO CHANGE THE MODEL (corrected design)
+
+        ssh-2222.yaml is now the ONLY place the model is named. Change
+        llmModel there and that is the whole change.
+
+        The first version of this had the name in two places: llmModel in the
+        service YAML and OLLAMA_MODEL in .env for the pull command. That was
+        pointless - you still had to edit the YAML by hand, because Beelzebub
+        does not expand environment variables inside service configs (only
+        core config has BEELZEBUB_* overrides, see
+        internal/parser/configurations_parser.go:269-320). So the .env entry
+        added a file to keep in step without removing any work, and if the two
+        ever disagreed the pull would succeed and then every command would
+        fail at request time - a silent, annoying failure.
+
+        Replaced with Beekeeper Scripts/Ollama/pull-models.sh, mounted into
+        the ollama-pull container. It scans configurations/services/*.yaml,
+        picks out the files with llmProvider: ollama, reads each llmModel, and
+        pulls them. OLLAMA_MODEL has been removed from .env and .env.example.
+
+        Why this is better than hardcoding the model in docker-compose.yml:
+          - one source of truth, so no drift is possible
+          - point another service at Ollama later and its model is pulled
+            automatically, with no edit to compose or the script
+          - two services sharing a model only pull it once
+          - a service set to ollama with no llmModel exits 1 with a clear
+            message, which (via service_completed_successfully) stops the
+            stack rather than letting it boot half-broken
+
+        Tested against the real configs and against temporary fixtures:
+          - ssh-2222.yaml only              -> pulls llama3.2:3b, skips the
+                                               two openai services
+          - two ollama services             -> pulls both models
+          - two services, same model        -> pulls once
+          - llmProvider: ollama, no model   -> ERROR + exit 1
+
+        Note: Beekeeper Scripts/Ollama/pull-models.sh MUST keep LF line
+        endings. git config core.autocrlf is true on this machine, which would
+        otherwise hand the container a CRLF file and fail with
+        "/bin/sh^M: bad interpreter". A .gitattributes was added at the repo
+        root with "*.sh text eol=lf" to pin that.
+
+GPU: a commented-out deploy.resources.reservations.devices block sits in the
+ollama service. Uncomment it only if the VM has an NVIDIA GPU AND the NVIDIA
+Container Toolkit is installed on the host - without the toolkit the
+container fails to start. CPU-only is the default.
+
+Boot order is now:
+  rabbitmq (healthy) -> ollama (healthy) -> ollama-pull (completed) -> beelzebub
+with slack-notifier starting as soon as rabbitmq is healthy.
+
+STILL TO DO - the other two LLM services were NOT converted:
+
+  configurations/services/http-80.yaml            port 80, published
+  configurations/services/tcp-5432-postgresql-llm.yaml   port 5432, not published
+
+Both still carry llmProvider: "openai", llmModel: "gpt-4o" and a placeholder
+key (sk-proj-123456 and sk-proj-YOUR_KEY_HERE) left over from upstream. They
+will keep calling api.openai.com, get rejected for a bad key, and fall back
+to "command not found". Port 80 IS exposed, so that one will be hit in the
+wild and will fail. They were left alone deliberately: pointing port 80 at a
+CPU-only model means up to three model calls per HTTP request from every
+internet scanner that touches the box, which will bury the VM. Static
+responses on 80 and 5432, with the LLM only on 2222, is the safer setup -
+but that is a research-design call, not a bug fix.
+
+----------------------------------------------------------------------
+13. LIVE TEST RESULTS - what actually broke when the stack was run
+----------------------------------------------------------------------
+The whole stack was built and run, and a real SSH session was driven
+against port 2222 with alerts going to the live Discord webhook. Four
+things broke. All four are fixed below except the last, which is a
+hardware/model problem, not a code one.
+
+
+13a. NOTIFIER CRASH-LOOPED ON A SYNTAX ERROR
+     slack_notifier.py had three lines of debris appended after the
+     if __name__ block - "ack=True)", a print, and channel.start_consuming() -
+     left over from an earlier version of the file:
+
+         SyntaxError: unmatched ')'   at line 142
+
+     The container restarted forever and consumed nothing. Cause was a
+     mangled shell heredoc during editing, not a logic error. Removed.
+
+     Worth knowing: the earlier test harness read the file with
+     .split("#consume loop")[0], so it only ever parsed the top half and
+     never saw the broken tail. A test that skips part of the file is not
+     a syntax check.
+
+
+13b. THE LLM RAN AWAY AND WEDGED THE SESSION FOREVER  (the big one)
+     Typing "ls -la /home" produced no reply at all. Not slow - never.
+     Left for 4 minutes, still nothing.
+
+     What was happening, from `docker stats` and the ollama logs:
+
+         ollama   801% CPU   4.3 GB
+         n_gen = 2714 tokens and climbing, at 7.1 tokens/sec
+
+     The model was generating thousands of tokens in reply to a one-line
+     ls, and would not stop. Two upstream facts make this fatal rather
+     than merely slow:
+
+       1. internal/plugins/llm-integration.go:141 builds the HTTP client
+          as plain resty.New() with NO SetTimeout, so Beelzebub waits
+          forever for a reply that never comes.
+
+       2. The Request struct at llm-integration.go:74-78 has only model,
+          messages and stream - there is no options/num_predict field.
+          So Beelzebub CANNOT send a token cap. You cannot fix this from
+          ssh-2222.yaml no matter what you put in it.
+
+     It also blocks everyone else: Ollama serves one request at a time per
+     model by default, so the second SSH session made zero model calls -
+     it queued behind the runaway and never ran. One attacker typing one
+     command denies the honeypot to every other attacker, which for a
+     research deployment means silently collecting nothing.
+
+     Evidence - the two wedged sessions eventually died at 500 when ollama
+     was restarted, after 7m6s and 6m3s:
+
+         07:00:15 | 500 | 7m6s | POST "/api/chat"
+         07:00:15 | 500 | 6m3s | POST "/api/chat"
+
+     and Beelzebub fell back to CommandOutput "command not found", which
+     is indistinguishable from the model legitimately saying that.
+
+     FIX APPLIED, no Go changes needed: cap the generation in the model
+     itself. Beekeeper Scripts/Ollama/Modelfile.ssh-honeypot builds a
+     derived model from llama3.2:3b with
+
+         PARAMETER num_predict 120      hard token cap
+         PARAMETER stop "root@ubuntu"   stop inventing the next prompt
+         PARAMETER stop "$ "
+         PARAMETER temperature 0.1      terminal output is not creative
+         PARAMETER num_ctx 2048
+
+     built with `ollama create ssh-honeypot -f Modelfile.ssh-honeypot`,
+     and ssh-2222.yaml now has llmModel: "ssh-honeypot".
+
+     After the fix the same command returned real output instead of
+     hanging. num_predict 120 did truncate `ls -la /home` mid-line, so
+     raise it (180-200) if you want complete listings - at the cost of
+     more seconds per command.
+
+     STILL RECOMMENDED, needs a small Go patch:
+       - add client.SetTimeout(60*time.Second) at llm-integration.go:141
+         so a hung model fails fast instead of wedging the session
+       - set OLLAMA_NUM_PARALLEL on the ollama service so one slow request
+         cannot block every other session
+
+
+13c. EVERY INTERESTING EVENT WAS SUPPRESSED
+     The first live run sent exactly one Discord message - the login
+     attempt, with a blank Request - and then suppressed the command, as
+     predicted. The 300s cooldown was keyed on the IP alone, so the
+     Stateless login event claimed the alert and the Interaction event
+     carrying "ls -la /home" was dropped as a repeat.
+
+     FIX APPLIED, in slack_notifier.py:
+
+       - SKIP_STATUSES = {"Start", "End"} drops the session open/close
+         bookkeeping before it can consume an alert slot.
+       - The cooldown key is now (ip, action) instead of ip, where action
+         is the URL for HTTP or the typed command for SSH. A repeated
+         identical action is still throttled; a new command or new URL
+         always gets through.
+       - Note Stateless could not simply be excluded: it is the login
+         event for SSH but it is also the ONLY status HTTP events use, so
+         dropping it would have silently killed HTTP alerting.
+
+     The message itself now also carries Service, Event, Credentials
+     (user/password on login attempts) and the honeypot's actual reply in
+     a code block, truncated at 900 chars to stay under Discord's 2000
+     char cap. The reply is the research payload - it was previously not
+     in the alert at all, and "Response given" was showing the static
+     service description instead.
+
+     Verified live. One session now produces two correct messages:
+
+       Active probing detected
+       **Time:** 2026-10-08T07:04:22Z
+       **Protocol:** SSH
+       **Source IP:** 172.18.0.6
+       **Service:** SSH interactive ChatGPT
+       **Event:** New SSH Login Attempt
+       **Request:** (none)
+       **Credentials:** root / 123456
+
+       Active probing detected
+       **Time:** 2026-10-08T07:04:30Z
+       **Protocol:** SSH
+       **Source IP:** 172.18.0.6
+       **Service:** SSH interactive ChatGPT
+       **Event:** SSH Terminal Session Interaction
+       **Request:** cat /etc/passwd
+       **Response given:**
+       ```
+       user:x:1000:1000:User,,,:/home/user:/bin/bash
+       root:x:0:0:root,,,:/:/bin/bash
+       ```
+
+
+13d. CPU INFERENCE IS TOO SLOW TO BE CONVINCING  (not fixed - a choice)
+     Measured, with the capped model, for ONE typed command:
+
+         input validation call    5.4s
+         main prompt call        14.4s
+         output validation call  15.8s
+         ------------------------------
+         total                  ~36s model time, 56s wall clock
+
+     A second command measured 26.5s. A real SSH server answers
+     instantly, so a 26-56 second pause after every keystroke is itself a
+     strong tell that this is not a real host.
+
+     This is the cost of the three-calls-per-command design (see note
+     below on guardrails) running a 3B model on CPU at ~7 tokens/sec.
+
+     Options, roughly in order of effect:
+       - turn off inputValidationEnabled and outputValidationEnabled.
+         They currently do nothing anyway (see the guardrail note below)
+         and they are two thirds of the latency. This alone takes a
+         command from ~36s to ~14s.
+       - give the VM a GPU, which is the only way to reach
+         conversational speed with a model of useful size.
+       - keep the model warm with OLLAMA_KEEP_ALIVE so the first command
+         after an idle period does not also pay a model load.
+
+     Note the VM sizing trap: glm-4.7-flash is a real Ollama library
+     model (the registry returns 200 for it) and it is already on the
+     Windows dev machine, but it is 19 GB. It needs roughly 24 GB of RAM
+     to run. It fits the 25 GB dev box; it will not fit a typical 8-16 GB
+     Azure VM, where it will be OOM-killed mid-request and look exactly
+     like the hang in 13b. Confirm the VM's RAM before choosing it.
+
+
+WHAT WAS CONFIRMED WORKING
+     - beelzebub and slack-notifier images both build clean
+     - boot order held: rabbitmq healthy -> ollama healthy -> ollama-pull
+       completed (2.0 GB llama3.2:3b, 51s) -> beelzebub started
+     - the `ollama list` healthcheck works (this was an unverified risk)
+     - pull-models.sh read the model out of ssh-2222.yaml correctly and
+       skipped the two openai services
+     - SSH on 2222 serves the banner SSH-2.0-OpenSSH and accepts the
+       configured password 123456
+     - the prompt renders as root@ubuntu:~$
+     - the full chain fires: SSH -> tracer -> rabbitmq -> notifier ->
+       Discord, with Discord accepting the payload (2xx)
+
+
+======================================================================
+TO SWITCH FROM DISCORD TO SLACK
+======================================================================
+
+1. In .env, change the two values:
+
+       WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/XXXX
+       PLATFORM=slack
+
+   No code change is needed. PLATFORM=slack flips PAYLOAD_KEY from "content"
+   to "text" and BOLD from "**" to "*" automatically.
+
+2. Recreate the container so it picks up the new environment:
+
+       docker compose up -d slack-notifier
+
+   (A rebuild is only needed if slack_notifier.py itself changed:
+    docker compose up -d --build slack-notifier)
+
+Shortcut if you ever want to send Slack-formatted messages to Discord
+without changing PLATFORM: Discord exposes a Slack compatible endpoint, so
+appending /slack to the Discord webhook URL makes it accept
+{"text": "..."}. Fine for a quick test, but the bold syntax is still wrong
+that way, so setting PLATFORM is the better option.
+
+
+======================================================================
+HOW TO TEST
+======================================================================
+
+  docker compose up -d --build
+  docker compose ps                      # rabbitmq should read (healthy)
+  docker logs -f slack-notifier          # expect "Listening for events"
+
+Then generate an event:
+
+  curl http://<vm-address>:8080/.env     # http honeypot
+  ssh -p 2222 root@<vm-address>          # password: 123456
+
+Expected in the notifier log:
+  Alert sent for <your ip>
+and a matching message in the Discord channel. If a post is rejected you
+will now see the status code and Discord's error body on that line instead
+of a false "Alert sent".
+
+
+======================================================================
+THINGS NOT CHANGED, STILL WORTH KNOWING
+======================================================================
+
+- Events are not durable. internal/builder/builder.go:83 declares the queue
+  with durable=false and the rabbitmq service has no volume, so restarting
+  the broker loses anything queued. If the notifier is down, events arriving
+  in that window are dropped rather than delivered late. Fixing it properly
+  means a durable queue on the Beelzebub side, so it is a code change, not
+  just compose.
+
+- Webhook rate limits differ and there is no backoff. Discord allows roughly
+  30 messages per minute per webhook and answers 429 with a retry_after;
+  Slack is about 1 per second. A 429 is now logged rather than silently
+  swallowed, but the alert is still dropped, not retried.
+
+- Discord caps a message at 2000 characters. Current alerts are far short of
+  that, but adding CommandOutput to the message could reach it.
+
+- PROBE_THRESHOLD is still 1, which is the testing value, not a realistic
+  "active probing" threshold. Raise it before collecting real data.
+
+- The alert you receive is the LOGIN ATTEMPT, not the command. One SSH
+  session emits four events in this order: New SSH Login Attempt (Stateless),
+  New SSH Terminal Session (Start), one SSH Terminal Session Interaction per
+  command typed (Interaction), then End SSH Session (End). With
+  PROBE_THRESHOLD = 1 the first event wins the alert and the 300s cooldown
+  then suppresses the rest, so the Discord message shows a blank **Request:**
+  (the login event has no Command) while the commands actually typed are
+  suppressed. Not a bug, but probably the opposite of what you want for the
+  research. Options: only alert on Status == "Interaction", or key the
+  cooldown on (ip, Status) instead of ip alone, so a login and a command are
+  tracked separately.
+
+- The two custom guardrail prompts in ssh-2222.yaml will never block
+  anything. internal/plugins/llm-integration.go:451 and :483 only treat a
+  verdict as a block when the model replies with exactly the word
+  "malicious" (lowercased and trimmed). Both custom prompts end with
+  "Answer only yes or no", so a "yes" verdict falls through as safe and the
+  guardrails are effectively off. To make them work, reword both prompts to
+  ask for `malicious` or `not malicious` - see the built-in wording at
+  llm-integration.go:23-26. The literal regex guard above the plugin in the
+  commands list still works, since that is matched by Beelzebub, not the LLM.
+
+- Alert state is in-memory, so a notifier restart clears the per-IP cooldown
+  and request history. Expect some duplicate alerts after a restart.
+
+- configurations/beelzebub.yaml sets logsPath: ./logs, and builder.go:49
+  opens that path as a FILE (not a directory) inside a FROM scratch
+  container with no volume mounted there. Beelzebub's own log file therefore
+  dies with the container. If the research needs those raw logs kept, mount
+  something at that path in docker-compose.yml.
+
+- "Azure Log Alerts/" is an empty directory. Git does not track empty
+  directories, so it will not survive a commit and clone.
+
+- There is no .dockerignore, and the root Dockerfile does COPY . ., so
+  "Beekeeper Scripts/" is now copied into the Go build context. Harmless,
+  just slower builds and more cache invalidation.

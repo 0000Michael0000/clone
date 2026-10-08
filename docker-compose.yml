@@ -29,3 +29,100 @@ services:
     volumes:
       - "./configurations:/configurations"
       - "./state:/state"
+    # Ollama now runs as the "ollama" service below, so the LLM plugin no longer
+    # needs to reach the VM host. Kept only so host.docker.internal still
+    # resolves on Linux if any config is pointed back at the host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      rabbitmq:
+        # Wait for the broker to accept connections, not just for the container
+        # to start - Beelzebub exits if its initial AMQP dial fails.
+        condition: service_healthy
+      ollama-pull:
+        # Don't go live until the model is actually downloaded, otherwise early
+        # visitors get "command not found" from a honeypot with no brain behind it.
+        # Change to service_started if you would rather boot anyway on a failed pull.
+        condition: service_completed_successfully
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    restart: unless-stopped
+    # Bound to 127.0.0.1 so the broker and management UI are NOT exposed to the
+    # internet. The guest:guest default would otherwise be publicly reachable.
+    # Reach the UI from your machine with an SSH tunnel:
+    #   ssh -L 15672:127.0.0.1:15672 <user>@<vm>
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  slack-notifier:
+    build: "./Beekeeper Scripts/Slack_alerts"
+    container_name: slack-notifier
+    environment:
+      # Webhook lives in .env (gitignored), not in the script or the image.
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      PLATFORM: ${PLATFORM:-discord}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    # Models are several GB. This named volume keeps them across restarts and
+    # rebuilds, so they download once rather than on every boot.
+    volumes:
+      - "ollama-models:/root/.ollama"
+    # Deliberately no ports: block. Only beelzebub talks to Ollama, over the
+    # compose network. Publishing 11434 would put an unauthenticated model API
+    # on the public interface of a machine that is being actively attacked.
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    # NVIDIA GPU: uncomment this block. Needs the NVIDIA Container Toolkit
+    # installed on the VM - without it the container will fail to start.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # One-shot helper: tells the ollama service to download the models, then exits.
+  # It runs on every `docker compose up` but is near-instant once they are in
+  # the volume.
+  #
+  # The model names are not configured here. pull-models.sh reads them out of
+  # configurations/services/*.yaml, so the service config stays the single
+  # source of truth and there is no second copy to drift out of step.
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: ollama-pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      # Point the CLI at the ollama service, not at its own unstarted server.
+      OLLAMA_HOST: "http://ollama:11434"
+    volumes:
+      - "./configurations:/configurations:ro"
+      - "./Beekeeper Scripts/Ollama/pull-models.sh:/pull-models.sh:ro"
+    entrypoint: ["/bin/sh", "/pull-models.sh"]
+    restart: "no"
+
+volumes:
+  ollama-models:

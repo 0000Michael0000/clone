@@ -6,8 +6,8 @@ core:
     logsPath: ./logs
   tracings:
     rabbit-mq:
-      enabled: false
-      uri: ""
+      enabled: true
+      uri: "amqp://guest:guest@rabbitmq:5672/"
   prometheus:
     path: "/metrics"
     port: ":2112"

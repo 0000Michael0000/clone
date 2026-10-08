@@ -1,0 +1,17 @@
+FROM llama3.2:3b
+
+# Hard cap on generated tokens. This is the important one: Beelzebub cannot
+# send num_predict (its Request struct has no options field), so the limit has
+# to live in the model itself or a single command runs away for thousands of
+# tokens and wedges the SSH session forever.
+PARAMETER num_predict 120
+
+# Stop as soon as the model tries to invent the next shell prompt, which is
+# how it rambles into a whole fake session.
+PARAMETER stop "root@ubuntu"
+PARAMETER stop "$ "
+PARAMETER stop "```"
+
+# Terminal output should be near-deterministic, not creative.
+PARAMETER temperature 0.1
+PARAMETER num_ctx 2048
